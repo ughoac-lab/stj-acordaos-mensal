@@ -62,15 +62,13 @@ MESES = ["", "janeiro", "fevereiro", "março", "abril", "maio", "junho",
          "julho", "agosto", "setembro", "outubro", "novembro", "dezembro"]
 
 
-def latest_resource(slug: str) -> dict | None:
+def ckan_resources(slug: str) -> list[dict]:
     api = f"{CKAN}/api/3/action/package_show?id={slug}"
     r = requests.get(api, headers=HEADERS, timeout=60)
     r.raise_for_status()
     res = r.json()["result"]["resources"]
-    jsons = [x for x in res if (x.get("format") or "").upper() == "JSON"
-             and re.match(r"\d{8}\.json", x.get("name") or "")]
-    jsons.sort(key=lambda x: x["name"], reverse=True)
-    return jsons[0] if jsons else None
+    return [x for x in res if (x.get("format") or "").upper() == "JSON"
+            and re.match(r"\d{8}\.json", x.get("name") or "")]
 
 
 def parse_pub_date(raw: str | None) -> datetime.date | None:
@@ -92,27 +90,32 @@ def match_terms(ementa: str) -> list[str]:
 
 
 def fetch() -> tuple[list[dict], str]:
+    """Baixa TODOS os meses do ano corrente (o ano do arquivo mais recente
+    disponível) das 3 turmas/seções e mantém só os tributários."""
+    por_orgao = {nome: ckan_resources(slug) for nome, slug in DATASETS.items()}
+    todos_nomes = [r["name"] for rs in por_orgao.values() for r in rs]
+    if not todos_nomes:
+        return [], ""
+    year = max(todos_nomes)[:4]
     acordaos: list[dict] = []
-    mes_yyyymm = ""
-    for nome, slug in DATASETS.items():
-        res = latest_resource(slug)
-        if not res:
-            print(f"  {nome}: sem arquivo")
-            continue
-        mes_yyyymm = max(mes_yyyymm, res["name"][:6])
-        recs = requests.get(res["url"], headers=HEADERS, timeout=120).json()
-        n = 0
-        for rec in recs:
-            ementa = rec.get("ementa") or ""
-            if not ANCHOR_RE.search(ementa):
-                continue
-            rec["_orgao"] = rec.get("nomeOrgaoJulgador") or nome
-            rec["_data"] = parse_pub_date(rec.get("dataPublicacao"))
-            rec["_terms"] = match_terms(ementa)
-            acordaos.append(rec)
-            n += 1
-        print(f"  {nome} ({res['name']}): {len(recs)} acórdãos, {n} tributários")
-    return acordaos, mes_yyyymm
+    for nome, rs in por_orgao.items():
+        do_ano = sorted([r for r in rs if r["name"].startswith(year)],
+                        key=lambda r: r["name"])
+        for res in do_ano:
+            recs = requests.get(res["url"], headers=HEADERS, timeout=120).json()
+            n = 0
+            for rec in recs:
+                ementa = rec.get("ementa") or ""
+                if not ANCHOR_RE.search(ementa):
+                    continue
+                rec["_orgao"] = rec.get("nomeOrgaoJulgador") or nome
+                rec["_data"] = parse_pub_date(rec.get("dataPublicacao"))
+                rec["_terms"] = match_terms(ementa)
+                rec["_month"] = res["name"][:6]
+                acordaos.append(rec)
+                n += 1
+            print(f"  {nome} {res['name'][:6]}: {len(recs)} acórdãos, {n} tributários")
+    return acordaos, year
 
 
 CSS = """
@@ -215,7 +218,13 @@ def _sidebar(titulo: str, counter: Counter, cls: str) -> str:
             f'<li class="todos" onclick="limpar(\'{cls}\')">Todos</li>{itens}</ul></div>')
 
 
-def render_html(acordaos: list[dict], mes_yyyymm: str, now: datetime.datetime) -> str:
+def _mes_nome(yyyymm: str) -> str:
+    if len(yyyymm) == 6 and yyyymm[4:6].isdigit():
+        return f"{MESES[int(yyyymm[4:6])].capitalize()} de {yyyymm[:4]}"
+    return "(sem data)"
+
+
+def render_html(acordaos: list[dict], year: str, now: datetime.datetime) -> str:
     org_counter: Counter = Counter()
     trib_counter: Counter = Counter()
     for a in acordaos:
@@ -223,26 +232,23 @@ def render_html(acordaos: list[dict], mes_yyyymm: str, now: datetime.datetime) -
         for t in a.get("_terms") or []:
             trib_counter[t] += 1
 
-    groups: dict[datetime.date | None, list[dict]] = {}
+    groups: dict[str, list[dict]] = {}
     for a in acordaos:
-        groups.setdefault(a.get("_data"), []).append(a)
-    ordered = sorted([d for d in groups if d], reverse=True)
-    if None in groups:
-        ordered.append(None)
+        groups.setdefault(a.get("_month") or "?", []).append(a)
 
     sections = []
-    for d in ordered:
-        titulo = (f"{d.day} de {MESES[d.month]} de {d.year}" if d else "(sem data)")
-        items = "\n".join(render_item(a) for a in groups[d])
-        sections.append(f'<h2 class="data">{titulo} '
-                        f'<span class="qtd">({len(groups[d])})</span></h2>\n{items}')
+    for mes in sorted(groups, reverse=True):
+        ordenados = sorted(groups[mes],
+                           key=lambda a: a.get("_data") or datetime.date.min,
+                           reverse=True)
+        items = "\n".join(render_item(a) for a in ordenados)
+        sections.append(f'<h2 class="data">{_mes_nome(mes)} '
+                        f'<span class="qtd">({len(groups[mes])})</span></h2>\n{items}')
     body = ("\n".join(sections) if sections
-            else '<p class="empty">Nenhum acórdão tributário no mês.</p>')
+            else '<p class="empty">Nenhum acórdão tributário no ano.</p>')
 
-    if mes_yyyymm and len(mes_yyyymm) == 6:
-        mes_nome = f"{MESES[int(mes_yyyymm[4:6])]}/{mes_yyyymm[:4]}"
-    else:
-        mes_nome = "?"
+    meses = sorted([m for m in groups if m != "?"])
+    periodo = (f"{_mes_nome(meses[0])} a {_mes_nome(meses[-1])}" if meses else "—")
     sidebar = (_sidebar("Órgão julgador", org_counter, "f-orgao")
                + _sidebar("Tributo", trib_counter, "f-tributo")) if acordaos else ""
     now_str = now.strftime("%d/%m/%Y às %H:%M")
@@ -251,16 +257,16 @@ def render_html(acordaos: list[dict], mes_yyyymm: str, now: datetime.datetime) -
 <head>
   <meta charset="utf-8">
   <meta name="viewport" content="width=device-width, initial-scale=1">
-  <title>Acórdãos Tributários — STJ (mensal)</title>
+  <title>Acórdãos Tributários — STJ · {year}</title>
   <style>{CSS}</style>
 </head>
 <body>
-  <h1>Acórdãos Tributários — STJ</h1>
+  <h1>Acórdãos Tributários — STJ · {year}</h1>
   <div class="topo">→ <a href="{LINK_MONOCRATICAS}">Ver decisões monocráticas (diário)</a></div>
   <div class="status">
-    <div>📅 Mês de referência: <b>{mes_nome}</b> · <b>{len(acordaos)}</b> acórdãos tributários (1ª/2ª Turma + 1ª Seção).</div>
-    <div>🤖 Atualizado em {now_str} · fonte: Dados Abertos do STJ.</div>
-    <div>🪟 Acórdãos publicados mensalmente (com ~2-3 semanas de atraso). Use os filtros à esquerda.</div>
+    <div>📅 Ano de <b>{year}</b> · período: <b>{periodo}</b> · <b>{len(acordaos)}</b> acórdãos tributários (1ª/2ª Turma + 1ª Seção).</div>
+    <div>🤖 Atualizado em {now_str} · fonte: Dados Abertos do STJ · acumula os meses do ano (mais recente no topo).</div>
+    <div>🪟 Publicação mensal (com ~2-3 semanas de atraso). Use os filtros à esquerda.</div>
   </div>
   <div class="layout">
     <aside class="filtros">{sidebar}</aside>
@@ -273,10 +279,10 @@ def render_html(acordaos: list[dict], mes_yyyymm: str, now: datetime.datetime) -
 
 def main() -> None:
     print("Baixando Dados Abertos do STJ (acórdãos)...")
-    acordaos, mes = fetch()
-    print(f"Total de acórdãos tributários: {len(acordaos)} (mês {mes})")
+    acordaos, year = fetch()
+    print(f"Total de acórdãos tributários: {len(acordaos)} (ano {year})")
     now = datetime.datetime.now()
-    OUTPUT_FILE.write_text(render_html(acordaos, mes, now), encoding="utf-8")
+    OUTPUT_FILE.write_text(render_html(acordaos, year, now), encoding="utf-8")
     print(f"HTML salvo: {OUTPUT_FILE}")
     import os
     import webbrowser
